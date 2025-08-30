@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: wheels-relay
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    envVars:
+      - key: INGEST_TOKEN
+        sync: false
+      - key: ORIGINS
+        value: "https://wesonwheels.com,https://www.wesonwheels.com"
