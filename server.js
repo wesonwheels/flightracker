@@ -1,23 +1,24 @@
-// npm i express cors
-const express = require("express");
-const cors = require("cors");
+// server.js  (ESM)
+import express from "express";
+import cors from "cors";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.INGEST_TOKEN || "449a6c2b8a4361a5f5c6058ad56c4a1e";
 
-app.use(cors({ origin: true })); // allows https origins and file:// (null)
+app.use(cors({ origin: true }));
 app.use(express.json());
 
 // flightId => Set(res)
 const clients = new Map();
 // flightId => last JSON string
-const latest = new Map();
+const latest  = new Map();
 
 function sendSSE(res, jsonString) {
-  res.write(`data: ${jsonString}\n\n`); // <-- proper SSE frame
+  res.write(`data: ${jsonString}\n\n`); // proper SSE frame
 }
 
+// Preflight for ingest
 app.options("/ingest", (req, res) => {
   res.set({
     "Access-Control-Allow-Origin": "*",
@@ -38,8 +39,6 @@ app.post("/ingest", (req, res) => {
   const set = clients.get(flight);
   if (set && set.size) for (const c of set) sendSSE(c, json);
 
-  // Also broadcast to a raw NDJSON endpoint if you ever want it:
-  // (client below doesn't need this; it can read SSE or NDJSON)
   res.status(204).end();
 });
 
@@ -49,17 +48,17 @@ app.get("/stream", (req, res) => {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*",
-    "X-Accel-Buffering": "no", // disables proxy buffering (nginx)
+    "Access-Control-Allow-Origin": "*", // allows https and file:// (null)
+    "X-Accel-Buffering": "no",
     "Vary": "Origin",
   });
-  res.flushHeaders?.();
-  res.write(": ok\n\n"); // comment to open stream
+  if (res.flushHeaders) res.flushHeaders();
+  res.write(": ok\n\n");
 
-  // Keepalive so proxies don't close idle connections
+  // Keepalive pings so proxies don’t close the stream
   const ping = setInterval(() => res.write(": keepalive\n\n"), 25000);
 
-  // Send the last known point immediately (if any)
+  // Send last point immediately
   const last = latest.get(flight);
   if (last) sendSSE(res, last);
 
@@ -73,5 +72,8 @@ app.get("/stream", (req, res) => {
   });
 });
 
-app.get("/", (req, res) => res.type("text/plain").send("OK"));
-app.listen(PORT, () => console.log(`relay up on :${PORT}`));
+app.get("/", (_, res) => res.type("text/plain").send("OK"));
+
+app.listen(PORT, () => {
+  console.log(`relay up on :${PORT}`);
+});
