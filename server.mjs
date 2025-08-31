@@ -2,7 +2,7 @@
 // Env on Render: SIMBRIEF_USER=YourSimBriefUsername  PORT=3000
 // Start: node server.js
 
-import express from "express";
+const express = (await import("express")).default
 import fs from "node:fs";
 import path from "node:path";
 
