@@ -1,46 +1,79 @@
-// server.js
-const express = require("express");
-const cors = require("cors");
+// server.js  (ESM)
+import express from "express";
+import cors from "cors";
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
+const TOKEN = process.env.INGEST_TOKEN || "449a6c2b8a4361a5f5c6058ad56c4a1e";
 
-// SSE clients
-let clients = [];
-
-// Health check endpoint
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", uptime: process.uptime() });
-});
-
-// Endpoint for simulator to POST flight data
+app.use(cors({ origin: true }));
 app.use(express.json());
-app.post("/update", (req, res) => {
-  const data = req.body;
-  if (!data) {
-    return res.status(400).json({ error: "No data received" });
-  }
-  // Broadcast to all connected SSE clients
-  clients.forEach((res) => res.write(`data: ${JSON.stringify(data)}\n\n`));
-  res.json({ ok: true });
+
+// flightId => Set(res)
+const clients = new Map();
+// flightId => last JSON string
+const latest  = new Map();
+
+function sendSSE(res, jsonString) {
+  res.write(`data: ${jsonString}\n\n`); // proper SSE frame
+}
+
+// Preflight for ingest
+app.options("/ingest", (req, res) => {
+  res.set({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, X-Ingest-Token",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+  });
+  res.end();
 });
 
-// SSE stream for frontend
-app.get("/stream", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
+app.post("/ingest", (req, res) => {
+  if (req.header("x-ingest-token") !== TOKEN) return res.status(401).end();
+  const flight = String(req.query.flight || req.body.flight || "default");
+  const now = Date.now();
+  const sample = { ...req.body, serverTs: req.body.serverTs ?? now };
+  const json = JSON.stringify(sample);
 
-  // Keep connection open
-  clients.push(res);
+  latest.set(flight, json);
+  const set = clients.get(flight);
+  if (set && set.size) for (const c of set) sendSSE(c, json);
+
+  res.status(204).end();
+});
+
+app.get("/stream", (req, res) => {
+  const flight = String(req.query.flight || "default");
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "Access-Control-Allow-Origin": "*", // allows https and file:// (null)
+    "X-Accel-Buffering": "no",
+    "Vary": "Origin",
+  });
+  if (res.flushHeaders) res.flushHeaders();
+  res.write(": ok\n\n");
+
+  // Keepalive pings so proxies don’t close the stream
+  const ping = setInterval(() => res.write(": keepalive\n\n"), 25000);
+
+  // Send last point immediately
+  const last = latest.get(flight);
+  if (last) sendSSE(res, last);
+
+  // Track client
+  if (!clients.has(flight)) clients.set(flight, new Set());
+  clients.get(flight).add(res);
+
   req.on("close", () => {
-    clients = clients.filter((c) => c !== res);
+    clearInterval(ping);
+    clients.get(flight)?.delete(res);
   });
 });
 
-// Use Render's dynamic port, fallback for local testing
-const PORT = process.env.PORT || 10000;
+app.get("/", (_, res) => res.type("text/plain").send("OK"));
+
 app.listen(PORT, () => {
-  console.log(`Relay up on :${PORT}`);
+  console.log(`relay up on :${PORT}`);
 });
