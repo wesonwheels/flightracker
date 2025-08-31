@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "Wheels Airlines SSE relay: /ingest (POST) -> /stream (SSE) with per-flight channels and SimBrief proxy.",
-  "type": "module",           //
+  "type": "module",  
   "main": "server.js",
   "engines": { "node": ">=18" },
   "scripts": {
