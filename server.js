@@ -1,5 +1,6 @@
-// server.js (ESM) — Render-ready API for SimBrief planned route
+// server.js (ESM) — Render-ready API for Wheels Tracker
 // Env on Render: SIMBRIEF_USER=YourSimBriefUsername  PORT=3000
+// Start: node server.js
 
 import express from "express";
 import fs from "node:fs";
@@ -12,25 +13,26 @@ const PORT = process.env.PORT || 3000;
 app.set("trust proxy", true);
 app.use(express.json());
 
-// CORS (allow your PebbleHost frontend to call this API)
+// CORS (allow PebbleHost frontend to call this API)
 app.use((req, res, next) => {
-  // For tighter security later, replace '*' with your site origin, e.g. 'https://wesonwheels.com'
+  // Tighten later: set this to 'https://yourdomain.com'
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   next();
 });
 
-// --- Health check ---
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
-});
+// --- Root & Health check ---
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/api/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
-// --- SimBrief planned route endpoint ---
-// GET /api/route               -> uses SIMBRIEF_USER from env
-// GET /api/route?user=NAME     -> overrides user
-// GET /api/route?ofp_id=123456 -> specific OFP
+// ============================
+//   SimBrief planned route
+//   GET /api/route
+//   GET /api/route?user=NAME
+//   GET /api/route?ofp_id=123456
+// ============================
 let routeCache = { ts: 0, user: null, ofp_id: null, data: null };
-const CACHE_MS = 60 * 1000; // cache SimBrief response for 60s
+const CACHE_MS = 60 * 1000; // 60s cache
 
 app.get("/api/route", async (req, res) => {
   try {
@@ -38,14 +40,12 @@ app.get("/api/route", async (req, res) => {
     const ofp_id = (req.query.ofp_id || "").trim();
     if (!user) return res.status(400).json({ error: "Missing SimBrief user (?user= or SIMBRIEF_USER)" });
 
-    // Serve from cache when possible
     const now = Date.now();
     if (routeCache.data && now - routeCache.ts < CACHE_MS &&
         routeCache.user === user && routeCache.ofp_id === ofp_id) {
       return res.json(routeCache.data);
     }
 
-    // Build SimBrief URL (JSON output)
     const params = new URLSearchParams({ username: user, json: "1" });
     if (ofp_id) params.set("ofp_id", ofp_id);
     const url = `https://www.simbrief.com/api/xml.fetcher.php?${params.toString()}`;
@@ -54,7 +54,6 @@ app.get("/api/route", async (req, res) => {
     if (!r.ok) throw new Error(`SimBrief fetch failed: HTTP ${r.status}`);
     const ofp = await r.json();
 
-    // Extract route points (structure can vary by OFP format)
     let points = [];
     if (Array.isArray(ofp?.general?.route_points)) {
       points = ofp.general.route_points.map(p => ({
@@ -70,7 +69,6 @@ app.get("/api/route", async (req, res) => {
       }));
     }
     points = points.filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon));
-
     if (!points.length) return res.status(404).json({ error: "No route points found in OFP" });
 
     const dep = ofp?.origin?.icao_code || ofp?.origin?.iata_code || "";
@@ -78,7 +76,6 @@ app.get("/api/route", async (req, res) => {
     const callsign = ofp?.general?.icao_id || ofp?.general?.flight_number || "";
     const routeStr = ofp?.general?.route || ofp?.atc?.route || "";
 
-    // GeoJSON line
     const line = {
       type: "Feature",
       properties: {
@@ -91,13 +88,9 @@ app.get("/api/route", async (req, res) => {
         distance_nm: ofp?.general?.plan_routetotaldistance || ofp?.general?.route_distance || null,
         alt_cruise_ft: ofp?.general?.initial_altitude || ofp?.general?.cruise_altitude || null
       },
-      geometry: {
-        type: "LineString",
-        coordinates: points.map(p => [p.lon, p.lat])
-      }
+      geometry: { type: "LineString", coordinates: points.map(p => [p.lon, p.lat]) }
     };
 
-    // Optional waypoint points
     const pointsFC = {
       type: "FeatureCollection",
       features: points.map(p => ({
@@ -108,7 +101,6 @@ app.get("/api/route", async (req, res) => {
     };
 
     const payload = { line, points: pointsFC };
-
     routeCache = { ts: Date.now(), user, ofp_id, data: payload };
     res.json(payload);
   } catch (err) {
@@ -117,11 +109,114 @@ app.get("/api/route", async (req, res) => {
   }
 });
 
+// ============================
+//   SimBrief latest meta proxy
+//   GET /simbrief/latest?username=NAME
+//   GET /simbrief/latest?userid=1234567
+//   Returns: { ok, meta: {...} }
+// ============================
+let metaCache = { ts: 0, key: "", data: null };
+const META_CACHE_MS = 60 * 1000;
+
+app.get("/simbrief/latest", async (req, res) => {
+  try {
+    const username = (req.query.username || "").trim();
+    const userid = (req.query.userid || "").trim();
+    if (!username && !userid && !process.env.SIMBRIEF_USER) {
+      return res.status(400).json({ ok: false, error: "Provide username= or userid= (or set SIMBRIEF_USER)" });
+    }
+
+    const key = username ? `u:${username}` : (userid ? `id:${userid}` : `u:${process.env.SIMBRIEF_USER}`);
+    const now = Date.now();
+    if (metaCache.data && metaCache.key === key && (now - metaCache.ts < META_CACHE_MS)) {
+      return res.json(metaCache.data);
+    }
+
+    const params = new URLSearchParams({ json: "1" });
+    if (username) params.set("username", username);
+    else if (userid) params.set("userid", userid);
+    else params.set("username", process.env.SIMBRIEF_USER);
+
+    const url = `https://www.simbrief.com/api/xml.fetcher.php?${params.toString()}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`SimBrief fetch failed: HTTP ${r.status}`);
+    const ofp = await r.json();
+
+    const meta = {
+      callsign: ofp?.general?.icao_id || ofp?.general?.flight_number || null,
+      flight_number: ofp?.general?.flight_number || null,
+      origin: ofp?.origin?.icao_code || ofp?.origin?.iata_code || null,
+      destination: ofp?.destination?.icao_code || ofp?.destination?.iata_code || null,
+      aircraft_icao: ofp?.aircraft?.icaocode || ofp?.aircraft?.icao_type || null,
+      reg: ofp?.aircraft?.reg || null,
+      etd: ofp?.times?.sched_out || ofp?.times?.est_out || null,
+      eta: ofp?.times?.sched_in || ofp?.times?.est_in || null,
+      cruise_alt_ft: ofp?.general?.initial_altitude || ofp?.general?.cruise_altitude || null,
+      route_text: ofp?.general?.route || ofp?.atc?.route || null,
+      distance_nm: ofp?.general?.plan_routetotaldistance || ofp?.general?.route_distance || null
+    };
+
+    const payload = { ok: true, meta };
+    metaCache = { ts: now, key, data: payload };
+    res.json(payload);
+  } catch (err) {
+    console.error("[/simbrief/latest] ", err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// ============================
+//   Live telemetry stream (SSE)
+//   GET /stream?flight=NAME
+//   Sends NDJSON over SSE (1 msg/sec) — stubbed motion
+//   Replace with real sim telemetry later.
+// ============================
+app.get("/stream", (req, res) => {
+  // Headers for SSE
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  // Use query to select different flights if needed
+  const flight = (req.query.flight || "default").toString();
+
+  // Simple demo track near DFW drifting east
+  let lat = 33.0 + Math.random() * 0.4;  // 33.0–33.4
+  let lon = -97.4 + Math.random() * 0.4; // -97.4–-97.0
+  let alt = 10000 + Math.random() * 2000;
+  let hdg = 90;
+
+  const tick = () => {
+    // Move the point a little
+    lon += 0.01;
+    const climb = (Math.random() - 0.5) * 200; // +/-100 fpm drift
+    alt += climb;
+
+    const d = {
+      flight,
+      lat: Number(lat),
+      lon: Number(lon),
+      alt_ft: Math.max(0, Math.round(alt)),
+      hdg_deg: Math.round(hdg),
+      gs_kts: 350,
+      vs_fpm: Math.round(climb * 3), // arbitrary
+      tas_kts: 360,
+      serverTs: Date.now()
+    };
+
+    res.write(`data: ${JSON.stringify(d)}\n\n`);
+  };
+
+  const timer = setInterval(tick, 1000);
+  req.on("close", () => clearInterval(timer));
+});
+
 // --- Static hosting (optional; harmless if you don't have a /public) ---
 const PUBLIC_DIR = path.join(process.cwd(), "public");
 if (fs.existsSync(PUBLIC_DIR)) {
   app.use(express.static(PUBLIC_DIR, { maxAge: "1h", extensions: ["html"] }));
-  // SPA fallback for convenience
+  // SPA fallback
   app.get("*", (req, res, next) => {
     const accept = req.headers.accept || "";
     if (accept.includes("text/html")) {
@@ -132,7 +227,7 @@ if (fs.existsSync(PUBLIC_DIR)) {
   });
 }
 
-// --- Start ---
+// --- Start server ---
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Tracker API running on http://0.0.0.0:${PORT}`);
 });
