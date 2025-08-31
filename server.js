@@ -1,148 +1,150 @@
-// server.js — Wheels Relay (ESM)
-// Works on Render at any subdomain (including flightracker-6mit). Provides:
-//   POST /ingest?flight=ID     (header: X-Ingest-Token)
-//   GET  /stream?flight=ID     (SSE; replays last point; keepalives)
-//   GET  /simbrief/latest?...  (optional mini-proxy)
-//   GET  /                     (OK)
-//
-// Package.json (for Render):
-// {
-//   "name": "wheels-relay",
-//   "private": true,
-//   "type": "module",
-//   "engines": { "node": ">=18" },
-//   "dependencies": { "express": "^4.19.2", "cors": "^2.8.5" },
-//   "scripts": { "start": "node server.js" }
-// }
+// server.js (ESM) – Flight tracker backend with SimBrief planned route
+// Run: node server.js
+// Env: SIMBRIEF_USER=YourSimBriefUsername  PORT=3000
 
-import express from "express";
-import cors from "cors";
+import 'dotenv/config';
+import express from 'express';
+import path from 'node:path';
+import fs from 'node:fs';
 
-// ===== Config =====
-const PORT = process.env.PORT || 3000;
-const INGEST_TOKEN = process.env.INGEST_TOKEN || "449a6c2b8a4361a5f5c6058ad56c4a1e";
-const KEEPALIVE_MS = 25000; // SSE ping interval
-
-// ===== App =====
 const app = express();
-app.set("trust proxy", true);
-app.use(cors({ origin: "*" }));
+const PORT = process.env.PORT || 3000;
+
+// --- Middleware ---
+app.set('trust proxy', true);
+app.use(express.json());
+
+// (Optional) tiny CORS for local dev; comment out if not needed
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Ingest-Token");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   next();
 });
-app.use(express.json({ limit: "256kb" }));
 
-// ===== State =====
-/** @type {Map<string, Set<import("http").ServerResponse>>} */
-const clientsByFlight = new Map();
-/** @type {Map<string, any>} */
-const latestByFlight = new Map();
-
-function getClients(flt) {
-  if (!clientsByFlight.has(flt)) clientsByFlight.set(flt, new Set());
-  return clientsByFlight.get(flt);
-}
-
-function writeSSE(res, eventName, payload) {
-  if (eventName) res.write(`event: ${eventName}\n`);
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-
-function keepAlive(res) { res.write(`: ok\n: keepalive\n\n`); }
-
-// ===== Routes =====
-app.options("/ingest", (_, res) => res.sendStatus(204));
-app.options("/stream", (_, res) => res.sendStatus(204));
-app.options("/simbrief/latest", (_, res) => res.sendStatus(204));
-
-app.get("/", (_req, res) => res.type("text/plain").send("OK"));
-
-// SSE stream per flight
-app.get("/stream", (req, res) => {
-  const flight = String(req.query.flight || "default");
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache, no-transform",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no"
-  });
-
-  const clients = getClients(flight);
-  clients.add(res);
-
-  // Cleanup
-  req.on("close", () => {
-    clients.delete(res);
-  });
-
-  // Replay last
-  const last = latestByFlight.get(flight);
-  if (last) writeSSE(res, null, last);
-
-  // Keepalive pings
-  const iv = setInterval(() => {
-    if (res.writableEnded) return clearInterval(iv);
-    try { keepAlive(res); } catch { clearInterval(iv); }
-  }, KEEPALIVE_MS);
+// --- Health check ---
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
-// Ingest points from MSFS client
-app.post("/ingest", (req, res) => {
-  const token = req.get("X-Ingest-Token") || req.get("x-ingest-token");
-  if (!token || token !== INGEST_TOKEN) return res.sendStatus(401);
+// --- SimBrief planned route endpoint ---
+// Returns: { line: <GeoJSON Feature LineString>, points: <FeatureCollection> }
+let routeCache = { ts: 0, user: null, ofp_id: null, data: null };
+const CACHE_MS = 60 * 1000; // 60s
 
-  const now = Date.now();
-  const flight = String(req.query.flight || req.body?.flight || "default");
-
-  const point = {
-    ...req.body,
-    flight,
-    serverTs: req.body?.serverTs ?? now,
-  };
-
-  latestByFlight.set(flight, point);
-
-  const clients = getClients(flight);
-  const payload = JSON.stringify(point);
-  for (const r of clients) {
-    try { r.write(`data: ${payload}\n\n`); } catch { /* ignore broken pipes */ }
-  }
-
-  return res.sendStatus(204);
-});
-
-// Optional: SimBrief proxy (very light XML scrape)
-// /simbrief/latest?username=NAME  or  /simbrief/latest?userid=1234567
-app.get("/simbrief/latest", async (req, res) => {
+app.get('/api/route', async (req, res) => {
   try {
-    const { username, userid } = req.query;
-    if (!username && !userid) return res.json({ ok: false, error: "missing username or userid" });
-    const qs = username ? `username=${encodeURIComponent(username)}` : `userid=${encodeURIComponent(userid)}`;
-    const url = `https://www.simbrief.com/api/xml.fetcher.php?${qs}`;
-    const r = await fetch(url, { headers: { "User-Agent": "WheelsRelay/1.0" } });
-    const xml = await r.text();
+    const user = (req.query.user || process.env.SIMBRIEF_USER || '').trim();
+    const ofp_id = (req.query.ofp_id || '').trim(); // optional: specific OFP id
 
-    const pick = (tag) => (xml.match(new RegExp(`<${tag}[^>]*>(.*?)<\/${tag}>`, "i"))||[])[1] || undefined;
-    const meta = {
-      flight_number: pick("flight_number") || pick("callsign"),
-      callsign: pick("callsign"),
-      origin: pick("origin"),
-      destination: pick("destination"),
-      aircraft_icao: pick("aircraft_icao") || pick("aircraft_type"),
-      etd: pick("etd"),
-      eta: pick("eta"),
+    if (!user) {
+      return res.status(400).json({ error: 'Missing SimBrief user (?user= or SIMBRIEF_USER)' });
+    }
+
+    const now = Date.now();
+    if (
+      routeCache.data &&
+      now - routeCache.ts < CACHE_MS &&
+      routeCache.user === user &&
+      routeCache.ofp_id === ofp_id
+    ) {
+      return res.json(routeCache.data);
+    }
+
+    // Build SimBrief URL
+    // Docs: https://www.simbrief.com/api/xml.fetcher.php
+    const params = new URLSearchParams({ username: user, json: '1' });
+    if (ofp_id) params.set('ofp_id', ofp_id);
+    const url = `https://www.simbrief.com/api/xml.fetcher.php?${params.toString()}`;
+
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`SimBrief fetch failed: HTTP ${r.status}`);
+    const ofp = await r.json();
+
+    // Extract route points. JSON structure can vary by OFP format.
+    let points = [];
+    if (Array.isArray(ofp?.general?.route_points)) {
+      points = ofp.general.route_points.map(p => ({
+        lat: parseFloat(p.lat),
+        lon: parseFloat(p.lon),
+        ident: p.ident || p.name || ''
+      }));
+    } else if (Array.isArray(ofp?.navlog?.fix)) {
+      points = ofp.navlog.fix.map(f => ({
+        lat: parseFloat(f.lat),
+        lon: parseFloat(f.lon),
+        ident: f.ident || f.name || ''
+      }));
+    }
+
+    points = points.filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+    if (!points.length) {
+      return res.status(404).json({ error: 'No route points found in OFP' });
+    }
+
+    const dep = ofp?.origin?.icao_code || ofp?.origin?.iata_code || '';
+    const arr = ofp?.destination?.icao_code || ofp?.destination?.iata_code || '';
+    const callsign = ofp?.general?.icao_id || ofp?.general?.flight_number || '';
+    const routeStr = ofp?.general?.route || ofp?.atc?.route || '';
+
+    const feature = {
+      type: 'Feature',
+      properties: {
+        source: 'SimBrief',
+        user,
+        callsign,
+        dep,
+        arr,
+        route: routeStr,
+        distance_nm:
+          ofp?.general?.plan_routetotaldistance ||
+          ofp?.general?.route_distance ||
+          null,
+        alt_cruise_ft:
+          ofp?.general?.initial_altitude ||
+          ofp?.general?.cruise_altitude ||
+          null
+      },
+      geometry: {
+        type: 'LineString',
+        coordinates: points.map(p => [p.lon, p.lat])
+      }
     };
-    res.json({ ok: true, meta });
-  } catch (e) {
-    res.json({ ok: false, error: String(e?.message || e) });
+
+    const pointsFC = {
+      type: 'FeatureCollection',
+      features: points.map(p => ({
+        type: 'Feature',
+        properties: { ident: p.ident },
+        geometry: { type: 'Point', coordinates: [p.lon, p.lat] }
+      }))
+    };
+
+    const payload = { line: feature, points: pointsFC };
+
+    routeCache = { ts: now, user, ofp_id, data: payload };
+    res.json(payload);
+  } catch (err) {
+    console.error('[SimBrief route] ', err);
+    res.status(500).json({ error: String(err) });
   }
 });
 
-// ===== Start =====
-app.listen(PORT, () => {
-  console.log(`[WheelsRelay] Listening on ${PORT}`);
+// --- Static hosting ---
+const PUBLIC_DIR = path.join(process.cwd(), 'public');
+if (fs.existsSync(PUBLIC_DIR)) {
+  app.use(express.static(PUBLIC_DIR, { maxAge: '1h', extensions: ['html'] }));
+  // Optional SPA fallback to /public/index.html
+  app.get('*', (req, res, next) => {
+    const accept = req.headers.accept || '';
+    if (accept.includes('text/html')) {
+      const idx = path.join(PUBLIC_DIR, 'index.html');
+      if (fs.existsSync(idx)) return res.sendFile(idx);
+    }
+    next();
+  });
+}
+
+// --- Start server ---
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Tracker running on http://0.0.0.0:${PORT}`);
 });
