@@ -1,4 +1,4 @@
-// server.mjs — Wheels Tracker API (ESM, Render-ready)
+ // server.mjs — Wheels Tracker API (ESM, Render-ready)
 
 const express = (await import("express")).default;
 import fs from "node:fs";
@@ -23,31 +23,36 @@ app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/api/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 // ===================================================
-// SimBrief: Planned Route
+// SimBrief: Planned Route (GeoJSON)
+// Accepts either ?user=<username> or ?userid=<numeric>
 // ===================================================
-let routeCache = { ts: 0, user: "", ofp_id: "", data: null };
+let routeCache = { ts: 0, key: "", data: null };
 const ROUTE_CACHE_MS = 60 * 1000;
 
 app.get("/api/route", async (req, res) => {
   try {
-    const user = (req.query.user || process.env.SIMBRIEF_USER || "").trim();
-    const ofp_id = (req.query.ofp_id || "").trim();
-    if (!user) return res.status(400).json({ error: "Missing SimBrief user (?user= or SIMBRIEF_USER)" });
-
+    const user   = (req.query.user || process.env.SIMBRIEF_USER || "").toString().trim();
+    const userid = (req.query.userid || "").toString().trim();
+    if (!user && !userid) {
+      return res.status(400).json({ error: "Missing SimBrief user (?user= or ?userid= or SIMBRIEF_USER)" });
+    }
+    const key = userid ? `id:${userid}` : `u:${user}`;
     const now = Date.now();
-    if (routeCache.data && now - routeCache.ts < ROUTE_CACHE_MS &&
-        routeCache.user === user && routeCache.ofp_id === ofp_id) {
+
+    if (routeCache.data && routeCache.key === key && now - routeCache.ts < ROUTE_CACHE_MS) {
       return res.json(routeCache.data);
     }
 
-    const params = new URLSearchParams({ username: user, json: "1" });
-    if (ofp_id) params.set("ofp_id", ofp_id);
-    const url = `https://www.simbrief.com/api/xml.fetcher.php?${params.toString()}`;
+    const params = new URLSearchParams({ json: "1" });
+    if (userid) params.set("userid", userid);
+    else params.set("username", user);
 
+    const url = `https://www.simbrief.com/api/xml.fetcher.php?${params.toString()}`;
     const r = await fetch(url);
     if (!r.ok) throw new Error(`SimBrief fetch failed: HTTP ${r.status}`);
     const ofp = await r.json();
 
+    // Extract route points from either general.route_points[] or navlog.fix[]
     let points = [];
     if (Array.isArray(ofp?.general?.route_points)) {
       points = ofp.general.route_points.map(p => ({
@@ -70,7 +75,9 @@ app.get("/api/route", async (req, res) => {
       type: "Feature",
       properties: {
         source: "SimBrief",
-        user, callsign, dep, arr, route: routeStr,
+        user: user || null,
+        userid: userid || null,
+        callsign, dep, arr, route: routeStr,
         distance_nm: ofp?.general?.plan_routetotaldistance || ofp?.general?.route_distance || null,
         alt_cruise_ft: ofp?.general?.initial_altitude || ofp?.general?.cruise_altitude || null
       },
@@ -87,7 +94,7 @@ app.get("/api/route", async (req, res) => {
     };
 
     const payload = { line, points: pointsFC };
-    routeCache = { ts: now, user, ofp_id, data: payload };
+    routeCache = { ts: now, key, data: payload };
     res.json(payload);
   } catch (err) {
     console.error("[/api/route]", err);
@@ -96,15 +103,16 @@ app.get("/api/route", async (req, res) => {
 });
 
 // ===================================================
-// SimBrief: Latest Meta
+// SimBrief: Latest Meta (callsign/origin/dest/etc.)
+// Accepts ?username= or ?userid= (or SIMBRIEF_USER env)
 // ===================================================
 let metaCache = { ts: 0, key: "", data: null };
 const META_CACHE_MS = 60 * 1000;
 
 app.get("/simbrief/latest", async (req, res) => {
   try {
-    const username = (req.query.username || "").trim();
-    const userid = (req.query.userid || "").trim();
+    const username = (req.query.username || "").toString().trim();
+    const userid   = (req.query.userid || "").toString().trim();
     if (!username && !userid && !process.env.SIMBRIEF_USER) {
       return res.status(400).json({ ok: false, error: "Provide username= or userid= (or set SIMBRIEF_USER)" });
     }
@@ -149,11 +157,16 @@ app.get("/simbrief/latest", async (req, res) => {
 });
 
 // ===================================================
-// Live Telemetry: Ingest + Stream
+// Live Telemetry: Ingest + Stream (per-flight channels)
 // ===================================================
 const INGEST_TOKEN = process.env.INGEST_TOKEN || "changeme-ingest-token";
 const liveData = new Map();
 
+/**
+ * POST /ingest?flight=WHEELS735
+ * Headers: X-Ingest-Token: <token>
+ * Body: { lat, lon, alt_ft?, hdg_deg?, gs_kts?, vs_fpm?, tas_kts?, serverTs? }
+ */
 app.post("/ingest", (req, res) => {
   const flight = (req.query.flight || "default").toString();
   const token = req.header("X-Ingest-Token");
@@ -178,24 +191,31 @@ app.post("/ingest", (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * GET /stream?flight=WHEELS735
+ * Server-Sent Events stream: sends the latest datum every second
+ */
 app.get("/stream", (req, res) => {
   const flight = (req.query.flight || "default").toString();
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
 
+  // send one immediately if we have it
   const now = liveData.get(flight);
   if (now) res.write(`data: ${JSON.stringify(now)}\n\n`);
 
+  // 1s ticker to repeat last known datum (keeps EventSource alive)
   const timer = setInterval(() => {
     const d = liveData.get(flight);
     if (d) res.write(`data: ${JSON.stringify(d)}\n\n`);
+    else res.write(`: keepalive\n\n`); // comment ping
   }, 1000);
 
   req.on("close", () => clearInterval(timer));
 });
 
-// ------------ Optional static hosting ------------
+// ------------ Optional static hosting (public/) ------------
 const PUBLIC_DIR = path.join(process.cwd(), "public");
 if (fs.existsSync(PUBLIC_DIR)) {
   app.use(express.static(PUBLIC_DIR, { maxAge: "1h", extensions: ["html"] }));
